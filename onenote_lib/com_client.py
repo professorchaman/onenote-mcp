@@ -39,9 +39,10 @@ def _run_ps(script: str, timeout: int = 30) -> str:
 
 def _run_ps_to_file(script: str, timeout: int = 30) -> str:
     """Execute PowerShell script that writes output to a temp file, return contents."""
-    tmp = tempfile.mktemp(suffix=".xml")
+    f = tempfile.NamedTemporaryFile(suffix=".xml", delete=False, mode="w", encoding="utf-8")
+    tmp = f.name
+    f.close()
     try:
-        # The script should write to $outFile
         full_script = f'$outFile = "{tmp}"\n{script}'
         _run_ps(full_script, timeout)
         with open(tmp, "r", encoding="utf-8-sig") as f:
@@ -104,11 +105,11 @@ $xml | Out-File -FilePath $outFile -Encoding UTF8 -NoNewline
 
 def update_page_content(xml_content: str) -> None:
     """Update/create page content."""
-    # Write XML to temp file to avoid quoting issues
-    tmp = tempfile.mktemp(suffix=".xml")
+    f = tempfile.NamedTemporaryFile(suffix=".xml", delete=False, mode="w", encoding="utf-8")
+    tmp = f.name
+    f.write(xml_content)
+    f.close()
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(xml_content)
         script = f"""
 $onenote = New-Object -ComObject OneNote.Application
 $xml = Get-Content -Path '{tmp}' -Raw -Encoding UTF8
@@ -168,3 +169,94 @@ $onenote = New-Object -ComObject OneNote.Application
 $onenote.DeleteHierarchy('{safe_id}')
 """
     _run_ps(script)
+
+
+def publish(object_id: str, output_path: str, publish_format: int = 3) -> None:
+    """Export a page/section/notebook to file.
+
+    publish_format: 0=OneNote, 1=OneNotePackage, 2=MHTML, 3=PDF,
+                    4=XPS, 5=Word, 6=EMF, 7=HTML
+    """
+    safe_id = object_id.replace("'", "''")
+    safe_path = output_path.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$onenote.Publish('{safe_id}', '{safe_path}', {publish_format})
+"""
+    _run_ps(script, timeout=120)
+
+
+def sync_hierarchy(object_id: str) -> None:
+    """Force sync of a notebook or section."""
+    safe_id = object_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$onenote.SyncHierarchy('{safe_id}')
+"""
+    _run_ps(script, timeout=60)
+
+
+def get_hyperlink(object_id: str) -> str:
+    """Get a onenote:// hyperlink URL for an object."""
+    safe_id = object_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$link = ""
+$onenote.GetHyperlinkToObject('{safe_id}', '', [ref]$link)
+$link
+"""
+    return _run_ps(script).strip()
+
+
+def close_notebook(notebook_id: str) -> None:
+    """Close a notebook."""
+    safe_id = notebook_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$onenote.CloseNotebook('{safe_id}')
+"""
+    _run_ps(script)
+
+
+def delete_page_content(page_id: str, object_id: str) -> None:
+    """Delete a specific content element from a page by its object ID."""
+    safe_pid = page_id.replace("'", "''")
+    safe_oid = object_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$onenote.DeletePageContent('{safe_pid}', '{safe_oid}')
+"""
+    _run_ps(script)
+
+
+def update_hierarchy(xml_content: str) -> None:
+    """Update hierarchy (rename sections, move pages, etc.) via XML."""
+    f = tempfile.NamedTemporaryFile(suffix=".xml", delete=False, mode="w", encoding="utf-8")
+    tmp = f.name
+    f.write(xml_content)
+    f.close()
+    try:
+        script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$xml = Get-Content -Path '{tmp}' -Raw -Encoding UTF8
+$onenote.UpdateHierarchy($xml)
+"""
+        _run_ps(script)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def get_special_location(location_type: int = 0) -> str:
+    """Get path to a special OneNote location.
+
+    location_type: 0=DefaultNotebookFolder, 1=UnfiledNotesSection,
+                   2=BackupFolder
+    """
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$path = ""
+$onenote.GetSpecialLocation({location_type}, [ref]$path)
+$path
+"""
+    return _run_ps(script).strip()

@@ -120,13 +120,15 @@ def parse_page_to_markdown(xml_str: str) -> tuple[str, list[ImageRef]]:
     title = root.get("name", root.get("ID", "Untitled"))
     lines = [f"# {title}", ""]
 
+    tag_defs = _parse_tag_defs(root)
+
     images: list[ImageRef] = []
     img_counter = 0
 
     # Process all Outline elements (main content containers)
     for outline in root.findall(".//one:Outline", NS):
         outline_lines, outline_images, img_counter = _process_outline(
-            outline, images_start_index=img_counter
+            outline, images_start_index=img_counter, tag_defs=tag_defs
         )
         lines.extend(outline_lines)
         images.extend(outline_images)
@@ -146,40 +148,106 @@ def parse_page_to_markdown(xml_str: str) -> tuple[str, list[ImageRef]]:
     return "\n".join(lines).strip(), images
 
 
-def _process_outline(outline, images_start_index: int = 0) -> tuple[list[str], list[ImageRef], int]:
+def _process_outline(outline, images_start_index: int = 0, tag_defs: dict | None = None) -> tuple[list[str], list[ImageRef], int]:
     """Process an Outline element into markdown lines."""
-    lines = []
-    images = []
-    img_counter = images_start_index
+    oe_children = outline.find("one:OEChildren", NS)
+    if oe_children is None:
+        return [], [], images_start_index
+    lines, images, img_counter = _walk_oe_children(oe_children, images_start_index, tag_defs=tag_defs or {})
+    return lines, images, img_counter
 
-    for oe in outline.iter():
-        tag = _local_tag(oe.tag)
 
-        if tag == "T":
-            # Text element — extract CDATA content
-            text = oe.text or ""
-            text = _clean_text(text)
-            if text.strip():
-                lines.append(text)
+def _walk_oe_children(
+    oe_children, img_counter: int, depth: int = 0, tag_defs: dict | None = None,
+) -> tuple[list[str], list[ImageRef], int]:
+    """Walk OE children with controlled dispatch — no double-visiting."""
+    lines: list[str] = []
+    images: list[ImageRef] = []
+    if tag_defs is None:
+        tag_defs = {}
 
-        elif tag == "Image":
-            cb_id = _get_callback_id(oe)
+    for oe in oe_children.findall("one:OE", NS):
+        table = oe.find("one:Table", NS)
+        if table is not None:
+            lines.extend(_process_table(table))
+            continue
+
+        image = oe.find("one:Image", NS)
+        if image is not None:
+            cb_id = _get_callback_id(image)
             if cb_id:
                 img_counter += 1
-                ref = _make_image_ref(oe, img_counter)
+                ref = _make_image_ref(image, img_counter)
                 if ref:
                     images.append(ref)
                     lines.append(f"[Image {ref.index}]")
+            continue
 
-        elif tag == "Table":
-            table_lines = _process_table(oe)
-            lines.extend(table_lines)
-
-        elif tag == "InsertedFile":
-            name = oe.get("preferredName", "file")
+        inserted = oe.find("one:InsertedFile", NS)
+        if inserted is not None:
+            name = inserted.get("preferredName", "file")
             lines.append(f"[Attached: {name}]")
+            continue
+
+        prefix = _get_tag_prefix(oe, tag_defs)
+        list_prefix = _get_list_prefix(oe, depth)
+
+        for t in oe.findall("one:T", NS):
+            text = _clean_text(t.text or "")
+            if text.strip():
+                indent = "  " * depth
+                line = f"{indent}{list_prefix}{prefix}{text}" if (depth > 0 or list_prefix or prefix) else text
+                lines.append(line)
+
+        nested = oe.find("one:OEChildren", NS)
+        if nested is not None:
+            sub_lines, sub_images, img_counter = _walk_oe_children(
+                nested, img_counter, depth + 1, tag_defs=tag_defs,
+            )
+            lines.extend(sub_lines)
+            images.extend(sub_images)
 
     return lines, images, img_counter
+
+
+def _parse_tag_defs(root) -> dict:
+    """Extract TagDef definitions from a page root. Returns {index: {name, type, completed}}."""
+    defs = {}
+    for td in root.findall("one:TagDef", NS):
+        index = td.get("index", "")
+        tag_type = td.get("type", "")
+        name = td.get("name", "")
+        defs[index] = {"name": name, "type": tag_type}
+    return defs
+
+
+def _get_tag_prefix(oe, tag_defs: dict) -> str:
+    """Check if an OE has a Tag and return a checkbox/tag prefix."""
+    tag = oe.find("one:Tag", NS)
+    if tag is None:
+        return ""
+    index = tag.get("index", "")
+    completed = tag.get("completed", "false") == "true"
+    tag_def = tag_defs.get(index, {})
+    tag_type = tag_def.get("type", "")
+    if tag_type in ("0", "1", "2", "3", "4"):
+        return "[x] " if completed else "[ ] "
+    name = tag_def.get("name", "")
+    if name:
+        return f"[{name}] "
+    return ""
+
+
+def _get_list_prefix(oe, depth: int) -> str:
+    """Check if an OE has a List element and return bullet/number prefix."""
+    list_elem = oe.find("one:List", NS)
+    if list_elem is None:
+        return ""
+    if list_elem.find("one:Number", NS) is not None:
+        return "1. "
+    if list_elem.find("one:Bullet", NS) is not None:
+        return "- "
+    return ""
 
 
 def _process_table(table_elem) -> list[str]:
@@ -258,10 +326,11 @@ def _local_tag(tag: str) -> str:
 
 
 def _clean_text(text: str) -> str:
-    """Clean OneNote text content (strip HTML-like tags from CDATA)."""
-    # OneNote sometimes wraps text in span tags with styles
+    """Convert OneNote CDATA HTML to markdown-style formatting."""
+    text = _convert_links(text)
+    text = _convert_spans(text)
+    text = re.sub(r"<br\s*/?>", "\n", text)
     text = re.sub(r"<[^>]+>", "", text)
-    # Decode common HTML entities
     text = text.replace("&amp;", "&")
     text = text.replace("&lt;", "<")
     text = text.replace("&gt;", ">")
@@ -269,6 +338,42 @@ def _clean_text(text: str) -> str:
     text = text.replace("&apos;", "'")
     text = text.replace("&nbsp;", " ")
     return text
+
+
+def _convert_links(text: str) -> str:
+    """Convert <a href="url">text</a> to [text](url)."""
+    return re.sub(
+        r'<a\s+href="([^"]*)"[^>]*>(.*?)</a>',
+        r'[\2](\1)',
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+def _convert_spans(text: str) -> str:
+    """Convert styled spans to markdown formatting markers."""
+    def _replace_span(m: re.Match) -> str:
+        style = m.group(1)
+        content = m.group(2)
+        bold = "font-weight:bold" in style or "font-weight: bold" in style
+        italic = "font-style:italic" in style or "font-style: italic" in style
+        strike = "text-decoration:line-through" in style or "text-decoration: line-through" in style
+        if bold and italic:
+            return f"***{content}***"
+        if bold:
+            return f"**{content}**"
+        if italic:
+            return f"*{content}*"
+        if strike:
+            return f"~~{content}~~"
+        return content
+
+    return re.sub(
+        r'<span\s+style="([^"]*)"[^>]*>(.*?)</span>',
+        _replace_span,
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
 
 def parse_search_results(xml_str: str) -> list[dict]:
